@@ -3,6 +3,8 @@ import logging
 import requests
 import sqlite3
 import time
+import sys
+import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
 from telegram import Update
@@ -10,54 +12,228 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import pdfplumber
 from pdf2image import convert_from_path
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
+import PyPDF2
+import fitz  # PyMuPDF
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging with detailed output
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot_debug.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # ============================================
 # CONFIGURATION
 # ============================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+print("=" * 60)
+print("🤖 BOT STARTUP INITIATED")
+print("=" * 60)
 
-# Parse allowed dispatchers from environment variable
-ALLOWED_DISPATCHERS = []
-allowed_dispatchers_str = os.getenv("ALLOWED_DISPATCHERS", "")
-if allowed_dispatchers_str:
-    try:
-        ALLOWED_DISPATCHERS = [int(x.strip()) for x in allowed_dispatchers_str.split(",") if x.strip()]
-    except ValueError as e:
-        logger.warning(f"Invalid ALLOWED_DISPATCHERS format: {e}")
+try:
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+    
+    print(f"✓ Bot Token loaded: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != 'YOUR_TELEGRAM_BOT_TOKEN_HERE')}")
+    print(f"✓ Mistral API Key loaded: {bool(MISTRAL_API_KEY and MISTRAL_API_KEY != 'YOUR_MISTRAL_API_KEY_HERE')}")
+    
+    # Parse allowed dispatchers from environment variable
+    ALLOWED_DISPATCHERS = []
+    allowed_dispatchers_str = os.getenv("ALLOWED_DISPATCHERS", "")
+    if allowed_dispatchers_str:
+        try:
+            ALLOWED_DISPATCHERS = [int(x.strip()) for x in allowed_dispatchers_str.split(",") if x.strip()]
+            print(f"✓ Allowed dispatchers: {len(ALLOWED_DISPATCHERS)} users")
+        except ValueError as e:
+            logger.warning(f"Invalid ALLOWED_DISPATCHERS format: {e}")
+            print(f"⚠ Warning: Invalid ALLOWED_DISPATCHERS format")
+    else:
+        print(f"✓ No user restrictions (all users allowed)")
+    
+    # Set Tesseract path
+    tesseract_path = os.getenv('TESSERACT_CMD', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
+    if os.path.exists(tesseract_path):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        print(f"✓ Tesseract found at: {tesseract_path}")
+    else:
+        print(f"⚠ Warning: Tesseract not found at: {tesseract_path}")
+        print(f"  OCR features will not work!")
+    
+    # Rate limiting configuration
+    MAX_REQUESTS_PER_HOUR = 10
+    user_requests = defaultdict(list)
+    
+    # Maintenance mode
+    MAINTENANCE_MODE = os.getenv("MAINTENANCE_MODE", "false").lower() == "true"
+    print(f"✓ Maintenance mode: {'ON' if MAINTENANCE_MODE else 'OFF'}")
+    
+except Exception as e:
+    print(f"❌ CONFIGURATION ERROR: {e}")
+    traceback.print_exc()
+    sys.exit(1)
 
-# Set Tesseract path (adjust for your system)
-# Windows default:
-pytesseract.pytesseract.tesseract_cmd = os.getenv(
-    'TESSERACT_CMD', 
-    r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-)
+# ============================================
+# ADVANCED PDF EXTRACTOR CLASS
+# ============================================
 
-# Linux/Mac (uncomment if needed):
-# pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+class AdvancedPDFExtractor:
+    """Advanced PDF text extraction with multiple fallback methods"""
+    
+    def __init__(self):
+        logger.info("Initializing AdvancedPDFExtractor")
+    
+    def preprocess_image(self, image: Image.Image) -> Image.Image:
+        """Advanced image preprocessing for better OCR"""
+        try:
+            image = image.convert('L')
+            enhancer = ImageEnhance.Contrast(image)
+            image = enhancer.enhance(2.0)
+            enhancer = ImageEnhance.Sharpness(image)
+            image = enhancer.enhance(2.0)
+            threshold = 150
+            image = image.point(lambda p: 255 if p > threshold else 0)
+            image = image.filter(ImageFilter.MedianFilter(size=3))
+            return image
+        except Exception as e:
+            logger.warning(f"Image preprocessing failed: {e}")
+            return image.convert('L')
+    
+    def clean_text(self, text: str) -> str:
+        """Clean and normalize extracted text"""
+        if not text:
+            return ""
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            line = ' '.join(line.split())
+            if line.strip():
+                cleaned_lines.append(line)
+        return '\n'.join(cleaned_lines)
+    
+    def extract_with_pymupdf(self, pdf_path: str):
+        """Method 1: PyMuPDF extraction"""
+        try:
+            logger.info("Method 1: Trying PyMuPDF...")
+            text = ""
+            doc = fitz.open(pdf_path)
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                page_text = page.get_text("text")
+                if page_text.strip():
+                    text += f"\n--- Page {page_num + 1} ---\n{page_text}"
+            doc.close()
+            text = self.clean_text(text)
+            if len(text.strip()) > 100:
+                logger.info(f"✅ PyMuPDF extracted {len(text)} characters")
+                return text
+            return None
+        except Exception as e:
+            logger.error(f"PyMuPDF extraction failed: {e}")
+            return None
+    
+    def extract_with_pdfplumber(self, pdf_path: str):
+        """Method 2: PDFPlumber extraction"""
+        try:
+            logger.info("Method 2: Trying PDFPlumber...")
+            text = ""
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+            text = self.clean_text(text)
+            if len(text.strip()) > 100:
+                logger.info(f"✅ PDFPlumber extracted {len(text)} characters")
+                return text
+            return None
+        except Exception as e:
+            logger.error(f"PDFPlumber extraction failed: {e}")
+            return None
+    
+    def extract_with_pypdf2(self, pdf_path: str):
+        """Method 3: PyPDF2 extraction"""
+        try:
+            logger.info("Method 3: Trying PyPDF2...")
+            text = ""
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page_num in range(len(pdf_reader.pages)):
+                    page = pdf_reader.pages[page_num]
+                    page_text = page.extract_text()
+                    if page_text.strip():
+                        text += f"\n--- Page {page_num + 1} ---\n{page_text}"
+            text = self.clean_text(text)
+            if len(text.strip()) > 100:
+                logger.info(f"✅ PyPDF2 extracted {len(text)} characters")
+                return text
+            return None
+        except Exception as e:
+            logger.error(f"PyPDF2 extraction failed: {e}")
+            return None
+    
+    def extract_with_ocr(self, pdf_path: str, max_pages: int = 10):
+        """Method 4: OCR extraction"""
+        try:
+            logger.info("Method 4: Trying OCR...")
+            images = convert_from_path(pdf_path, dpi=300, first_page=1, last_page=max_pages)
+            text = ""
+            for i, image in enumerate(images):
+                logger.info(f"OCR processing page {i + 1}/{len(images)}...")
+                processed_image = self.preprocess_image(image)
+                page_text = pytesseract.image_to_string(processed_image, config='--psm 1 --oem 3')
+                if page_text.strip():
+                    text += f"\n--- Page {i + 1} (OCR) ---\n{page_text}\n"
+            text = self.clean_text(text)
+            if len(text.strip()) > 50:
+                logger.info(f"✅ OCR extracted {len(text)} characters")
+                return text
+            return None
+        except Exception as e:
+            logger.error(f"OCR extraction failed: {e}")
+            return None
+    
+    def extract_text(self, pdf_path: str):
+        """Main extraction method - tries all methods"""
+        if not os.path.exists(pdf_path):
+            return {"text": None, "method": "error", "error": "File not found", "success": False}
+        
+        methods = [
+            ("pymupdf", self.extract_with_pymupdf),
+            ("pdfplumber", self.extract_with_pdfplumber),
+            ("pypdf2", self.extract_with_pypdf2),
+            ("ocr", self.extract_with_ocr),
+        ]
+        
+        for method_name, method_func in methods:
+            try:
+                result = method_func(pdf_path)
+                if result and len(result.strip()) > 100:
+                    return {
+                        "text": result,
+                        "method": method_name,
+                        "length": len(result),
+                        "success": True
+                    }
+            except Exception as e:
+                logger.error(f"Method {method_name} failed: {e}")
+                continue
+        
+        return {"text": None, "method": "all_failed", "success": False, "error": "All methods failed"}
 
-# Rate limiting configuration
-MAX_REQUESTS_PER_HOUR = 10
-user_requests = defaultdict(list)
-
-# Maintenance mode
-MAINTENANCE_MODE = os.getenv("MAINTENANCE_MODE", "false").lower() == "true"
+# ============================================
+# DATABASE FUNCTIONS
 # ============================================
 
 def init_db():
-    """Initialize SQLite database for tracking processed documents"""
+    """Initialize SQLite database"""
     try:
         conn = sqlite3.connect('dispatches.db')
         c = conn.cursor()
@@ -74,8 +250,10 @@ def init_db():
         conn.commit()
         conn.close()
         logger.info("Database initialized successfully")
+        print("✓ Database initialized")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
+        print(f"❌ Database error: {e}")
 
 def log_processing_result(user_id, user_name, file_name, file_size_mb, extraction_method, text_length, success):
     """Log processing results to database"""
@@ -91,139 +269,47 @@ def log_processing_result(user_id, user_name, file_name, file_size_mb, extractio
     except Exception as e:
         logger.error(f"Failed to log processing result: {e}")
 
+# ============================================
+# RATE LIMITING
+# ============================================
+
 def check_rate_limit(user_id: int) -> bool:
     """Check if user has exceeded rate limit"""
     now = datetime.now()
-    
-    # Clean old requests
-    user_requests[user_id] = [
-        req_time for req_time in user_requests[user_id] 
-        if now - req_time < timedelta(hours=1)
-    ]
-    
-    # Check limit
+    user_requests[user_id] = [req_time for req_time in user_requests[user_id] if now - req_time < timedelta(hours=1)]
     if len(user_requests[user_id]) >= MAX_REQUESTS_PER_HOUR:
         return False
-    
     user_requests[user_id].append(now)
     return True
 
 def get_rate_limit_info(user_id: int) -> str:
-    """Get rate limit information for user"""
+    """Get rate limit information"""
     now = datetime.now()
-    user_requests[user_id] = [
-        req_time for req_time in user_requests[user_id] 
-        if now - req_time < timedelta(hours=1)
-    ]
-    
+    user_requests[user_id] = [req_time for req_time in user_requests[user_id] if now - req_time < timedelta(hours=1)]
     remaining = MAX_REQUESTS_PER_HOUR - len(user_requests[user_id])
     return f"Requests this hour: {len(user_requests[user_id])}/{MAX_REQUESTS_PER_HOUR} ({remaining} remaining)"
 
-def validate_pdf(file_path: str) -> bool:
-    """Check if PDF is valid and not password protected"""
-    try:
-        with pdfplumber.open(file_path) as pdf:
-            # Try to access first page
-            if len(pdf.pages) > 0:
-                _ = pdf.pages[0].extract_text()
-            return True
-    except Exception as e:
-        logger.error(f"PDF validation failed: {e}")
-        return False
-
-def clean_extracted_text(text):
-    """Clean and preprocess extracted text"""
-    if not text:
-        return ""
-    
-    # Remove excessive whitespace but preserve paragraph structure
-    lines = text.split('\n')
-    cleaned_lines = []
-    
-    for line in lines:
-        line = ' '.join(line.split())  # Clean whitespace
-        if line.strip():
-            cleaned_lines.append(line)
-    
-    return '\n'.join(cleaned_lines)
-
-def extract_text_with_pdfplumber(pdf_path):
-    """Extract text using pdfplumber (better for complex PDFs)"""
-    try:
-        text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            logger.info(f"PDF has {len(pdf.pages)} pages")
-            for page_num, page in enumerate(pdf.pages):
-                page_text = page.extract_text()
-                if page_text:
-                    text += f"\n--- Page {page_num + 1} ---\n"
-                    text += page_text + "\n"
-        
-        text = clean_extracted_text(text)
-        logger.info(f"Extracted {len(text)} characters with pdfplumber")
-        return text if text.strip() else None
-    except Exception as e:
-        logger.error(f"pdfplumber extraction failed: {e}")
-        return None
-
-def extract_text_with_ocr(pdf_path):
-    """Extract text using OCR for scanned/image PDFs"""
-    try:
-        logger.info("Attempting OCR extraction...")
-        
-        # Convert PDF to images (limit to 5 pages for performance)
-        images = convert_from_path(pdf_path, dpi=200, first_page=1, last_page=5)
-        logger.info(f"Converted {len(images)} pages to images")
-        
-        text = ""
-        for i, image in enumerate(images):
-            logger.info(f"OCR processing page {i + 1}...")
-            
-            # Preprocess image for better OCR
-            image = image.convert('L')  # Convert to grayscale
-            
-            page_text = pytesseract.image_to_string(image)
-            if page_text.strip():
-                text += f"\n--- Page {i + 1} (OCR) ---\n"
-                text += page_text + "\n"
-        
-        text = clean_extracted_text(text)
-        logger.info(f"OCR extracted {len(text)} characters")
-        return text if text.strip() else None
-        
-    except Exception as e:
-        logger.error(f"OCR extraction failed: {e}")
-        return None
+# ============================================
+# PDF EXTRACTION
+# ============================================
 
 def extract_text_from_pdf(pdf_path):
-    """Try multiple methods to extract text from PDF"""
+    """Extract text using AdvancedPDFExtractor"""
+    extractor = AdvancedPDFExtractor()
+    result = extractor.extract_text(pdf_path)
     
-    # Validate PDF first
-    if not validate_pdf(pdf_path):
-        logger.error("PDF validation failed - file may be corrupted or password protected")
+    if result["success"]:
+        return {"text": result["text"], "method": result["method"]}
+    else:
+        logger.error(f"All extraction methods failed: {result.get('error', 'Unknown error')}")
         return None
-    
-    # Method 1: Try pdfplumber first (fast, good for text PDFs)
-    logger.info("Method 1: Trying pdfplumber...")
-    text = extract_text_with_pdfplumber(pdf_path)
-    
-    if text and len(text.strip()) > 100:
-        logger.info("✅ pdfplumber successful")
-        return {"text": text, "method": "pdfplumber"}
-    
-    # Method 2: If pdfplumber fails or gets little text, try OCR
-    logger.info("Method 2: Trying OCR...")
-    text = extract_text_with_ocr(pdf_path)
-    
-    if text and len(text.strip()) > 50:
-        logger.info("✅ OCR successful")
-        return {"text": text, "method": "ocr"}
-    
-    logger.error("❌ All extraction methods failed")
-    return None
+
+# ============================================
+# MISTRAL AI ANALYSIS
+# ============================================
 
 def analyze_load_with_mistral(text):
-    """Send PDF text to Mistral AI for load information extraction"""
+    """Send PDF text to Mistral AI"""
     try:
         prompt = f"""Analyze this trucking rate confirmation and extract load information. Format the response clearly and concisely.
 
@@ -236,41 +322,33 @@ def analyze_load_with_mistral(text):
 - Total Rate/Payment ($)
 - Commodity / Freight Type
 - Weight (lbs)
-- Equipment Type (Dry Van/Reefer/Flatbed/etc)
+- Equipment Type
 
 📍 **PICKUP INFORMATION:**
-- Date & Time (appointment or window)
-- Full Address (Street, City, State, ZIP)
+- Date & Time
+- Full Address
 - Company Name
-- Contact Person & Phone Number
-- Special pickup instructions
+- Contact Person & Phone
 
 🎯 **DELIVERY INFORMATION:**
-- Date & Time (appointment or window)
-- Full Address (Street, City, State, ZIP)
+- Date & Time
+- Full Address
 - Company Name
-- Contact Person & Phone Number
-- Special delivery instructions
+- Contact Person & Phone
 
 💰 **ADDITIONAL RATES:**
-- Detention rate (if any)
-- Layover rate (if any)
-- Lumper fee coverage
+- Detention rate
+- Layover rate
+- Lumper fee
 - TONU rate
 
 ⚠️ **SPECIAL INSTRUCTIONS:**
 - Temperature requirements
 - Appointment requirements
-- Any other important notes
-
-**FORMATTING:**
-- Use clear sections with emojis
-- Bold headings for each section
-- If information is not found, write "Not specified"
-- Keep it organized and easy to read
+- Other notes
 
 Rate Confirmation Document:
-{text[:15000]}"""  # Reduced character limit for better performance
+{text[:15000]}"""
 
         headers = {
             "Authorization": f"Bearer {MISTRAL_API_KEY}",
@@ -280,7 +358,7 @@ Rate Confirmation Document:
         payload = {
             "model": "mistral-large-latest",
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,  # Lower temperature for more consistent results
+            "temperature": 0.1,
             "max_tokens": 2000
         }
         
@@ -289,7 +367,7 @@ Rate Confirmation Document:
             "https://api.mistral.ai/v1/chat/completions",
             headers=headers,
             json=payload,
-            timeout=60  # Increased timeout
+            timeout=60
         )
         
         if response.status_code == 200:
@@ -299,33 +377,27 @@ Rate Confirmation Document:
             logger.error(f"Mistral API error {response.status_code}: {response.text}")
             return None
             
-    except requests.exceptions.Timeout:
-        logger.error("Mistral API request timed out")
-        return "❌ AI analysis timed out. Please try again with a smaller file or contact support."
     except Exception as e:
         logger.error(f"Error with Mistral AI: {e}")
         return None
 
+# ============================================
+# BOT COMMANDS
+# ============================================
+
 async def check_maintenance(update: Update) -> bool:
-    """Check if bot is in maintenance mode"""
+    """Check maintenance mode"""
     if MAINTENANCE_MODE:
-        await update.message.reply_text(
-            "🔧 **Maintenance Mode**\n\n"
-            "The bot is currently under maintenance. Please try again later.\n"
-            "We apologize for any inconvenience."
-        )
+        await update.message.reply_text("🔧 Bot is under maintenance. Try again later.")
         return False
     return True
 
 async def check_access(update: Update) -> bool:
-    """Check if user has access to the bot"""
+    """Check user access"""
     user_id = update.effective_user.id
-    
     if ALLOWED_DISPATCHERS and user_id not in ALLOWED_DISPATCHERS:
         await update.message.reply_text(
-            "⛔ **Access Denied**\n\n"
-            f"Your Telegram ID: `{user_id}`\n"
-            "Contact administrator to get access to this bot.",
+            f"⛔ Access Denied\n\nYour ID: `{user_id}`\nContact admin for access.",
             parse_mode='Markdown'
         )
         return False
@@ -333,171 +405,107 @@ async def check_access(update: Update) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    if not await check_maintenance(update):
+    if not await check_maintenance(update) or not await check_access(update):
         return
     
-    user_id = update.effective_user.id
     user_name = update.effective_user.first_name
-    
-    if not await check_access(update):
-        return
-    
     welcome = f"""🚛 **Enhanced Dispatch Bot**
-*Powered by Mistral AI with OCR Support*
 
 Welcome, {user_name}! 👋
 
 **Features:**
-✅ Text-based PDFs (fast processing)
-✅ Scanned/Image PDFs (OCR technology)
-✅ Complex layout handling
-✅ AI-powered data extraction
+✅ Text-based PDFs
+✅ Scanned/Image PDFs (OCR)
+✅ AI-powered extraction
 ✅ Rate limiting: {MAX_REQUESTS_PER_HOUR} requests/hour
 
 **Commands:**
-/start - Show this message
-/myid - Get your Telegram ID
-/help - Get help and instructions
-/stats - Get your usage statistics
+/start - This message
+/myid - Your Telegram ID
+/help - Help
+/stats - Your statistics
 
-**Simply send me any rate confirmation PDF!**"""
+**Send me a rate confirmation PDF!**"""
     
     await update.message.reply_text(welcome, parse_mode='Markdown')
 
 async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user their Telegram ID"""
+    """Show user ID"""
     if not await check_maintenance(update):
         return
-        
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name
-    
-    rate_limit_info = get_rate_limit_info(user_id)
-    
+    rate_info = get_rate_limit_info(user_id)
     await update.message.reply_text(
-        f"👤 **Your Information**\n"
-        f"Name: {user_name}\n"
-        f"Telegram ID: `{user_id}`\n\n"
-        f"📊 **Usage:**\n{rate_limit_info}",
+        f"👤 **Your Information**\nName: {user_name}\nID: `{user_id}`\n\n📊 {rate_info}",
         parse_mode='Markdown'
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
+    """Handle /help"""
     if not await check_maintenance(update):
         return
-        
-    help_text = f"""❓ **Help & Instructions**
+    help_text = f"""❓ **Help**
 
-**Supported PDF Types:**
-✅ Regular text PDFs (fastest)
-✅ Scanned documents (OCR)
+**Supported:**
+✅ Text PDFs
+✅ Scanned documents
 ✅ Image-based PDFs
-✅ Complex layouts and tables
 
-**File Requirements:**
-• Maximum size: 20 MB
-• Not password protected
-• Clear, readable text/images
-• One rate confirmation per file
+**Limits:**
+• Max size: 20 MB
+• {MAX_REQUESTS_PER_HOUR} requests/hour
 
-**Processing Times:**
-• Text PDFs: 10-20 seconds
-• Scanned PDFs: 30-90 seconds (OCR dependent)
-• AI Analysis: 10-20 seconds
-
-**Rate Limits:**
-• {MAX_REQUESTS_PER_HOUR} requests per hour per user
-
-**Tips for Best Results:**
-• Ensure PDFs are high quality
-• Avoid blurry or rotated scans
-• Crop unnecessary borders
-• Use well-lit, clear images
-
-**Need Help?**
-Contact your system administrator for support."""
-
+**Tips:**
+• Clear, readable files
+• Not password protected"""
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user their statistics"""
+    """Show user stats"""
     if not await check_maintenance(update):
         return
-        
     user_id = update.effective_user.id
-    
     try:
         conn = sqlite3.connect('dispatches.db')
         c = conn.cursor()
-        
-        # Get user stats
         c.execute('''SELECT COUNT(*) as total, 
-                            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful,
-                            AVG(file_size_mb) as avg_size
-                     FROM processed_docs 
-                     WHERE user_id = ?''', (user_id,))
-        
+                            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful
+                     FROM processed_docs WHERE user_id = ?''', (user_id,))
         result = c.fetchone()
         conn.close()
-        
-        total_processed = result[0] or 0
+        total = result[0] or 0
         successful = result[1] or 0
-        avg_size = result[2] or 0
-        
-        rate_limit_info = get_rate_limit_info(user_id)
-        
-        stats_text = f"""📊 **Your Statistics**
-
-📁 Total PDFs Processed: {total_processed}
-✅ Successful Extractions: {successful}
-📦 Average File Size: {avg_size:.1f} MB
-
-{rate_limit_info}"""
-
-        await update.message.reply_text(stats_text, parse_mode='Markdown')
-        
+        rate_info = get_rate_limit_info(user_id)
+        await update.message.reply_text(
+            f"📊 **Statistics**\n\nTotal: {total}\nSuccessful: {successful}\n\n{rate_info}",
+            parse_mode='Markdown'
+        )
     except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        await update.message.reply_text("❌ Could not retrieve statistics at this time.")
+        logger.error(f"Stats error: {e}")
+        await update.message.reply_text("❌ Could not retrieve statistics.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process PDF documents"""
-    if not await check_maintenance(update):
+    if not await check_maintenance(update) or not await check_access(update):
         return
-        
+    
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name
     
-    if not await check_access(update):
-        return
-    
-    # Check rate limiting
     if not check_rate_limit(user_id):
-        rate_limit_info = get_rate_limit_info(user_id)
-        await update.message.reply_text(
-            f"⏰ **Rate Limit Exceeded**\n\n"
-            f"You've reached the maximum number of requests per hour.\n\n"
-            f"{rate_limit_info}\n\n"
-            f"Please wait and try again later.",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text(f"⏰ Rate limit exceeded\n\n{get_rate_limit_info(user_id)}", parse_mode='Markdown')
         return
     
     document = update.message.document
     
     if not document.file_name.lower().endswith('.pdf'):
-        await update.message.reply_text("⚠️ Please send a PDF file. Other formats are not supported.")
+        await update.message.reply_text("⚠️ Please send a PDF file.")
         return
     
     file_size_mb = document.file_size / (1024 * 1024)
     if document.file_size > 20 * 1024 * 1024:
-        await update.message.reply_text(
-            f"⚠️ **File Too Large**\n\n"
-            f"File size: {file_size_mb:.1f} MB\n"
-            f"Maximum allowed: 20 MB\n\n"
-            f"Please compress the file or use a smaller PDF."
-        )
+        await update.message.reply_text(f"⚠️ File too large: {file_size_mb:.1f} MB (max: 20 MB)")
         return
     
     file_path = None
@@ -505,44 +513,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         status_msg = await update.message.reply_text(
-            "📥 **Downloading PDF...**\n"
-            f"File: `{document.file_name}`\n"
-            f"Size: {file_size_mb:.1f} MB\n"
-            f"User: {user_name}",
+            f"📥 **Downloading**\nFile: `{document.file_name}`\nSize: {file_size_mb:.1f} MB",
             parse_mode='Markdown'
         )
         
-        # Download file
         file = await context.bot.get_file(document.file_id)
         file_path = f"temp_{user_id}_{document.file_id}.pdf"
         await file.download_to_drive(file_path)
         
-        await status_msg.edit_text(
-            "📄 **Extracting Text...**\n"
-            "⏳ This may take 10-90 seconds depending on PDF type and size...\n"
-            "• Checking PDF validity\n"
-            "• Attempting text extraction\n"
-            "• Fallback to OCR if needed"
-        )
+        await status_msg.edit_text("📄 **Extracting text...**\n⏳ Please wait...")
         
-        # Extract text from PDF
         extraction_result = extract_text_from_pdf(file_path)
         
         if not extraction_result:
-            await status_msg.edit_text(
-                "❌ **Extraction Failed**\n\n"
-                "Could not extract text from this PDF.\n\n"
-                "**Possible Issues:**\n"
-                "• Password-protected PDF\n"
-                "• Corrupted file\n"
-                "• Unsupported format\n"
-                "• Poor image quality (for scanned PDFs)\n\n"
-                "**Solutions:**\n"
-                "• Ensure PDF is not encrypted\n"
-                "• Try a different PDF file\n"
-                "• Use higher quality scans\n"
-                "• Contact support if problem persists"
-            )
+            await status_msg.edit_text("❌ **Extraction Failed**\n\nCould not extract text from PDF.")
             log_processing_result(user_id, user_name, document.file_name, file_size_mb, "failed", 0, False)
             return
         
@@ -550,156 +534,104 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_text = extraction_result["text"]
         text_length = len(pdf_text)
         
-        if text_length < 100:
-            await status_msg.edit_text(
-                "⚠️ **Very Little Text Extracted**\n\n"
-                f"Only {text_length} characters found.\n"
-                "The PDF might be:\n"
-                "• Mostly blank or empty\n"
-                "• Contain only images without text\n"
-                "• Have unreadable content\n\n"
-                "Try a different PDF with more text content."
-            )
-            log_processing_result(user_id, user_name, document.file_name, file_size_mb, extraction_method, text_length, False)
-            return
-        
         await status_msg.edit_text(
-            "🤖 **Analyzing with AI...**\n"
-            f"Extracted {text_length} characters using {extraction_method.upper()}\n"
-            "• Processing with Mistral AI\n"
-            "• Extracting load details\n"
-            "• Formatting results...\n"
-            "⏳ This may take 10-20 seconds..."
+            f"🤖 **Analyzing with AI...**\nExtracted {text_length} chars using {extraction_method.upper()}"
         )
         
-        # Analyze with AI
         load_info = analyze_load_with_mistral(pdf_text)
         
         if not load_info:
-            await status_msg.edit_text(
-                "❌ **AI Analysis Failed**\n\n"
-                "Could not analyze the document with AI.\n\n"
-                "**Possible Causes:**\n"
-                "• API service temporarily unavailable\n"
-                "• Network connectivity issues\n"
-                "• Document content too complex\n\n"
-                "Please try again in a few minutes."
-            )
+            await status_msg.edit_text("❌ **AI Analysis Failed**")
             log_processing_result(user_id, user_name, document.file_name, file_size_mb, extraction_method, text_length, False)
             return
         
-        # Delete status message
         await status_msg.delete()
         
-        # Prepare and send results
         result_header = (
-            f"✅ **LOAD INFORMATION EXTRACTED**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📄 **File:** {document.file_name}\n"
-            f"👤 **Processed for:** {user_name}\n"
-            f"📊 **Method:** {extraction_method.upper()}\n"
-            f"🔢 **Text Length:** {text_length} characters\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ **LOAD INFORMATION**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📄 {document.file_name}\n"
+            f"👤 {user_name}\n"
+            f"📊 Method: {extraction_method.upper()}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
         )
         
         full_response = result_header + load_info
         
-        # Split message if too long for Telegram
         if len(full_response) <= 4000:
             await update.message.reply_text(full_response, parse_mode='Markdown')
         else:
-            # Send header first
             await update.message.reply_text(result_header, parse_mode='Markdown')
-            
-            # Split the load info into chunks
             chunks = [load_info[i:i+3800] for i in range(0, len(load_info), 3800)]
             for chunk in chunks:
                 await update.message.reply_text(chunk)
         
-        # Log successful processing
         log_processing_result(user_id, user_name, document.file_name, file_size_mb, extraction_method, text_length, True)
-        logger.info(f"✅ Successfully processed PDF for {user_name} using {extraction_method}")
+        logger.info(f"✅ Success for {user_name} using {extraction_method}")
         
     except Exception as e:
-        logger.error(f"Unexpected error processing PDF: {e}")
-        error_message = f"❌ **Unexpected Error**\n\n{str(e)[:300]}"
-        
+        logger.error(f"Error: {e}")
+        traceback.print_exc()
+        error_msg = f"❌ **Error**\n\n{str(e)[:300]}"
         if status_msg:
-            await status_msg.edit_text(error_message)
+            await status_msg.edit_text(error_msg)
         else:
-            await update.message.reply_text(error_message)
-        
-        # Log failed processing
+            await update.message.reply_text(error_msg)
         log_processing_result(user_id, user_name, document.file_name, file_size_mb, "error", 0, False)
         
     finally:
-        # Clean up temporary file
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
-                logger.info(f"Cleaned up temporary file: {file_path}")
-            except Exception as e:
-                logger.error(f"Failed to clean up temporary file: {e}")
+            except:
+                pass
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Global error handler"""
-    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
-    
-    # Notify user about critical errors
-    if update and update.effective_user:
-        try:
-            await update.message.reply_text(
-                "❌ **An unexpected error occurred**\n\n"
-                "The bot encountered an error while processing your request.\n"
-                "Please try again or contact support if the problem persists."
-            )
-        except:
-            pass
+    logger.error(f"Update error: {context.error}", exc_info=context.error)
+    traceback.print_exc()
 
 def main():
     """Start the bot"""
-    
-    # Validate required configuration
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("❌ ERROR: TELEGRAM_BOT_TOKEN not set!")
-        print("Please set the TELEGRAM_BOT_TOKEN environment variable")
-        return
-    
-    if not MISTRAL_API_KEY or MISTRAL_API_KEY == "YOUR_MISTRAL_API_KEY_HERE":
-        print("❌ ERROR: MISTRAL_API_KEY not set!")
-        print("Please set the MISTRAL_API_KEY environment variable")
-        return
-    
-    # Initialize database
-    init_db()
-    
-    # Create application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("myid", myid_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_error_handler(error_handler)
-    
-    # Startup message
-    print("=" * 60)
-    print("🚛 ENHANCED DISPATCH BOT WITH OCR & AI")
-    print("=" * 60)
-    print(f"✅ Bot Token: {'Set' if TELEGRAM_BOT_TOKEN else 'Missing'}")
-    print(f"✅ Mistral API Key: {'Set' if MISTRAL_API_KEY else 'Missing'}")
-    print(f"✅ Allowed Users: {len(ALLOWED_DISPATCHERS)}")
-    print(f"✅ Maintenance Mode: {'ON' if MAINTENANCE_MODE else 'OFF'}")
-    print(f"✅ Rate Limit: {MAX_REQUESTS_PER_HOUR}/hour per user")
-    print("✅ Database initialized")
-    print("📱 Bot is ready to process rate confirmations!")
-    print("⏹️  Press Ctrl+C to stop the bot")
-    print("=" * 60)
-    
-    # Start polling
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    try:
+        if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+            print("❌ ERROR: TELEGRAM_BOT_TOKEN not set!")
+            return
+        
+        if not MISTRAL_API_KEY or MISTRAL_API_KEY == "YOUR_MISTRAL_API_KEY_HERE":
+            print("❌ ERROR: MISTRAL_API_KEY not set!")
+            return
+        
+        init_db()
+        
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("myid", myid_command))
+        application.add_handler(CommandHandler("stats", stats_command))
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        application.add_error_handler(error_handler)
+        
+        print("=" * 60)
+        print("✅ BOT STARTED SUCCESSFULLY!")
+        print("=" * 60)
+        print("📱 Bot is ready to process PDFs!")
+        print("⏹️  Press Ctrl+C to stop")
+        print("=" * 60)
+        
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR: {e}")
+        traceback.print_exc()
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ STARTUP FAILED: {e}")
+        traceback.print_exc()
+        input("\nPress Enter to exit...")
